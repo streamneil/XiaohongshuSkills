@@ -1348,6 +1348,318 @@ class XiaohongshuPublisher:
             "success": True,
         }
 
+    def reply_to_comment(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        comment_id: str,
+        content: str,
+    ) -> dict[str, Any]:
+        """
+        Reply to a specific comment (post a sub-comment) on a feed detail page.
+
+        Navigates to the note, locates the target comment by its ID,
+        clicks its reply button to activate reply mode, fills in the
+        content and submits.
+
+        Args:
+            feed_id: The note/feed ID.
+            xsec_token: Security token for the note page.
+            comment_id: The comment ID to reply to (e.g. "67e16f6b0000000012020d03").
+            content: Reply text.
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        feed_id = feed_id.strip()
+        xsec_token = xsec_token.strip()
+        comment_id = comment_id.strip()
+        content = content.strip()
+
+        if not feed_id:
+            raise CDPError("feed_id cannot be empty.")
+        if not xsec_token:
+            raise CDPError("xsec_token cannot be empty.")
+        if not comment_id:
+            raise CDPError("comment_id cannot be empty.")
+        if not content:
+            raise CDPError("content cannot be empty.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        self._navigate(detail_url)
+        self._sleep(3, minimum_seconds=2.0)
+        self._check_feed_page_accessible()
+
+        comment_id_literal = json.dumps(comment_id, ensure_ascii=False)
+
+        click_reply_js = f"""
+            (function() {{
+                var commentId = {comment_id_literal};
+                var target = document.getElementById("comment-" + commentId);
+
+                if (!target) {{
+                    var items = document.querySelectorAll(".comment-item[id^='comment-']");
+                    for (var item of items) {{
+                        if (item.id === "comment-" + commentId) {{
+                            target = item;
+                            break;
+                        }}
+                    }}
+                }}
+
+                if (!target) {{
+                    return {{ ok: false, reason: "comment_not_found", commentId: commentId }};
+                }}
+
+                target.scrollIntoView({{ behavior: "instant", block: "center" }});
+
+                var replyBtn = target.querySelector(".reply.icon-container, .reply-icon, [class*='reply'][class*='icon']");
+                if (!replyBtn) {{
+                    var interactions = target.querySelector(".interactions");
+                    if (interactions) {{
+                        var children = interactions.children;
+                        for (var ch of children) {{
+                            if (ch.className && ch.className.includes("reply")) {{
+                                replyBtn = ch;
+                                break;
+                            }}
+                        }}
+                    }}
+                }}
+
+                if (!replyBtn) {{
+                    return {{ ok: false, reason: "reply_button_not_found" }};
+                }}
+
+                var r = replyBtn.getBoundingClientRect();
+                if (r.width < 4 || r.height < 4) {{
+                    return {{ ok: false, reason: "reply_button_not_visible" }};
+                }}
+
+                return {{
+                    ok: true,
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    height: r.height,
+                    foundId: target.id,
+                }};
+            }})()
+        """
+        reply_rect = self._evaluate(click_reply_js)
+        if not isinstance(reply_rect, dict) or not reply_rect.get("ok"):
+            reason = reply_rect.get("reason", "unknown") if isinstance(reply_rect, dict) else "unknown"
+            raise CDPError(
+                f"Could not locate comment reply button: {reason}. "
+                f"comment_id={comment_id}"
+            )
+
+        cx = reply_rect["x"] + reply_rect["width"] / 2
+        cy = reply_rect["y"] + reply_rect["height"] / 2
+        print(f"[cdp_publish] Clicking reply button for comment {comment_id} at ({cx:.0f}, {cy:.0f})...")
+        for event_type in ("mousePressed", "mouseReleased"):
+            self._send("Input.dispatchMouseEvent", {
+                "type": event_type,
+                "x": cx,
+                "y": cy,
+                "button": "left",
+                "clickCount": 1,
+            })
+            time.sleep(0.05)
+
+        self._sleep(1.0, minimum_seconds=0.5)
+
+        filled_len = self._fill_comment_content(content)
+        self._sleep(0.6, minimum_seconds=0.2)
+
+        submit_rect_js = """
+            (function() {
+                const selectors = [
+                    "div.bottom button.submit",
+                    "div.bottom button[class*='submit']",
+                    "button.submit",
+                    "button[class*='submit']",
+                    "button[type='submit']",
+                ];
+                for (const selector of selectors) {
+                    const el = document.querySelector(selector);
+                    if (!(el instanceof HTMLButtonElement) || el.offsetParent === null) {
+                        continue;
+                    }
+                    if (el.disabled) {
+                        continue;
+                    }
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                const fallbackTexts = new Set(["发送", "提交", "评论"]);
+                const buttons = document.querySelectorAll("button");
+                for (const button of buttons) {
+                    if (!(button instanceof HTMLButtonElement) || button.offsetParent === null) {
+                        continue;
+                    }
+                    if (button.disabled) {
+                        continue;
+                    }
+                    const text = (button.textContent || "").replace(/\\s+/g, " ").trim();
+                    if (!fallbackTexts.has(text)) {
+                        continue;
+                    }
+                    const r = button.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                return null;
+            })();
+        """
+        self._click_element_by_cdp("comment submit button", submit_rect_js)
+        self._sleep(1.0, minimum_seconds=0.4)
+
+        print(
+            f"[cdp_publish] Reply posted to comment {comment_id}. "
+            f"feed_id={feed_id}, length={filled_len}"
+        )
+        return {
+            "feed_id": feed_id,
+            "xsec_token": xsec_token,
+            "comment_id": comment_id,
+            "content_length": filled_len,
+            "success": True,
+        }
+
+    def like_comment(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        comment_id: str,
+    ) -> dict[str, Any]:
+        """
+        Like (or toggle like on) a specific comment on a feed detail page.
+
+        Args:
+            feed_id: The note/feed ID.
+            xsec_token: Security token for the note page.
+            comment_id: The comment ID to like.
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        feed_id = feed_id.strip()
+        xsec_token = xsec_token.strip()
+        comment_id = comment_id.strip()
+
+        if not feed_id:
+            raise CDPError("feed_id cannot be empty.")
+        if not xsec_token:
+            raise CDPError("xsec_token cannot be empty.")
+        if not comment_id:
+            raise CDPError("comment_id cannot be empty.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        self._navigate(detail_url)
+        self._sleep(3, minimum_seconds=2.0)
+        self._check_feed_page_accessible()
+
+        comment_id_literal = json.dumps(comment_id, ensure_ascii=False)
+
+        click_like_js = f"""
+            (function() {{
+                var commentId = {comment_id_literal};
+                var target = document.getElementById("comment-" + commentId);
+
+                if (!target) {{
+                    var items = document.querySelectorAll(".comment-item[id^='comment-']");
+                    for (var item of items) {{
+                        if (item.id === "comment-" + commentId) {{
+                            target = item;
+                            break;
+                        }}
+                    }}
+                }}
+
+                if (!target) {{
+                    return {{ ok: false, reason: "comment_not_found", commentId: commentId }};
+                }}
+
+                target.scrollIntoView({{ behavior: "instant", block: "center" }});
+
+                var likeWrapper = target.querySelector(".like-wrapper");
+                if (!likeWrapper) {{
+                    var likeContainer = target.querySelector(".like");
+                    if (likeContainer) {{
+                        likeWrapper = likeContainer.querySelector("span[class*='like-wrapper'], svg[class*='like-icon']");
+                    }}
+                }}
+
+                if (!likeWrapper) {{
+                    return {{ ok: false, reason: "like_button_not_found" }};
+                }}
+
+                var alreadyLiked = likeWrapper.classList.contains("like-active");
+
+                var r = likeWrapper.getBoundingClientRect();
+                if (r.width < 4 || r.height < 4) {{
+                    return {{ ok: false, reason: "like_button_not_visible" }};
+                }}
+
+                return {{
+                    ok: true,
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    height: r.height,
+                    alreadyLiked: alreadyLiked,
+                    foundId: target.id,
+                }};
+            }})()
+        """
+        like_rect = self._evaluate(click_like_js)
+        if not isinstance(like_rect, dict) or not like_rect.get("ok"):
+            reason = like_rect.get("reason", "unknown") if isinstance(like_rect, dict) else "unknown"
+            raise CDPError(
+                f"Could not locate comment like button: {reason}. "
+                f"comment_id={comment_id}"
+            )
+
+        already_liked = like_rect.get("alreadyLiked", False)
+        if already_liked:
+            print(f"[cdp_publish] Comment {comment_id} is already liked. Skipping.")
+            return {
+                "feed_id": feed_id,
+                "comment_id": comment_id,
+                "already_liked": True,
+                "success": True,
+            }
+
+        cx = like_rect["x"] + like_rect["width"] / 2
+        cy = like_rect["y"] + like_rect["height"] / 2
+        print(f"[cdp_publish] Clicking like button for comment {comment_id} at ({cx:.0f}, {cy:.0f})...")
+        for event_type in ("mousePressed", "mouseReleased"):
+            self._send("Input.dispatchMouseEvent", {
+                "type": event_type,
+                "x": cx,
+                "y": cy,
+                "button": "left",
+                "clickCount": 1,
+            })
+            time.sleep(0.05)
+
+        self._sleep(0.8, minimum_seconds=0.3)
+
+        print(f"[cdp_publish] Comment {comment_id} liked. feed_id={feed_id}")
+        return {
+            "feed_id": feed_id,
+            "xsec_token": xsec_token,
+            "comment_id": comment_id,
+            "already_liked": False,
+            "success": True,
+        }
+
     def _schedule_click_notification_mentions_tab(self) -> str:
         """Schedule a click on mentions tab after evaluate returns."""
         clicked_text = self._evaluate("""
@@ -2442,6 +2754,29 @@ def main():
     p_comment_content.add_argument("--content", help="Comment content")
     p_comment_content.add_argument("--content-file", help="Read comment content from file")
 
+    # reply-to-comment - reply to a specific comment (sub-comment)
+    p_reply = sub.add_parser(
+        "reply-to-comment",
+        aliases=["reply_to_comment"],
+        help="Reply to a specific comment on a feed detail page",
+    )
+    p_reply.add_argument("--feed-id", required=True, help="Feed id")
+    p_reply.add_argument("--xsec-token", required=True, help="xsec token")
+    p_reply.add_argument("--comment-id", required=True, help="Comment id to reply to")
+    p_reply_content = p_reply.add_mutually_exclusive_group(required=True)
+    p_reply_content.add_argument("--content", help="Reply content")
+    p_reply_content.add_argument("--content-file", help="Read reply content from file")
+
+    # like-comment - like a specific comment
+    p_like_comment = sub.add_parser(
+        "like-comment",
+        aliases=["like_comment"],
+        help="Like a specific comment on a feed detail page",
+    )
+    p_like_comment.add_argument("--feed-id", required=True, help="Feed id")
+    p_like_comment.add_argument("--xsec-token", required=True, help="xsec token")
+    p_like_comment.add_argument("--comment-id", required=True, help="Comment id to like")
+
     # get-notification-mentions - capture notification mentions API response
     p_mentions = sub.add_parser(
         "get-notification-mentions",
@@ -2698,6 +3033,43 @@ def main():
                 content=comment_content,
             )
             print("POST_COMMENT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("reply-to-comment", "reply_to_comment"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            reply_content = args.content
+            if args.content_file:
+                with open(args.content_file, encoding="utf-8") as f:
+                    reply_content = f.read().strip()
+            if not reply_content:
+                print("Error: --content or --content-file required.", file=sys.stderr)
+                sys.exit(1)
+
+            payload = publisher.reply_to_comment(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                comment_id=args.comment_id,
+                content=reply_content,
+            )
+            print("REPLY_TO_COMMENT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("like-comment", "like_comment"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.like_comment(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                comment_id=args.comment_id,
+            )
+            print("LIKE_COMMENT_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         elif args.command in ("get-notification-mentions", "get_notification_mentions"):
